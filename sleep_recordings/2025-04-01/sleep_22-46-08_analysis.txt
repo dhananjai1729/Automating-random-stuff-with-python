@@ -1,0 +1,12 @@
+Sleep Sound Analysis for sleep_recordings/2025-04-01/sleep_22-46-08.wav
+Recorded at: 2025-04-01 22:46:10
+
+Total recording duration: 23.31 seconds
+Background noise level: 0.004104
+Detected 4 sound events
+
+Sound events (timestamp in seconds):
+  Event 1: at 2.00s (level: 0.010314)
+  Event 2: at 5.00s (level: 0.008879)
+  Event 3: at 13.00s (level: 0.042280)
+  Event 4: at 14.00s (level: 0.051741)
