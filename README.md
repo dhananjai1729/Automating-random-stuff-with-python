@@ -7,3 +7,8 @@ Seems like I have to sort out my snoring.
 
 Confirmed this works on windows laptops as well.
 
+Next steps:
+
+Add a detection method for snoring
+Convert this to a mobile app
+
