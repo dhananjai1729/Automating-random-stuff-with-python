@@ -1,4 +1,3 @@
-add-readme
 # Sleep Monitor
 
 This repository contains a Python script for sleep monitoring. The script is implemented as a Jupyter Notebook (`sleepmonitor.ipynb`).
@@ -36,18 +35,3 @@ This repository contains a Python script for sleep monitoring. The script is imp
 5.  Click "Start Recording" to begin monitoring. The script will calibrate for background noise.
 6.  Click "Stop Recording" to end the session.
 7.  Recorded audio files (WAV), spectrogram images (PNG), and analysis text files (TXT) will be saved in the `sleep_recordings` directory.
-
-# Automating-random-stuff-with-python
-
-Here I try to build applications rather than downloading applications.
-
-Started with a sleep monitoring program
-Seems like I have to sort out my snoring.
-
-Confirmed this works on windows laptops as well.
-
-Next steps:
-
-Add a detection method for snoring
-Convert this to a mobile app
-
