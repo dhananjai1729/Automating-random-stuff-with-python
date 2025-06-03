@@ -7,6 +7,7 @@ import os
 import datetime
 import threading
 import matplotlib.pyplot as plt
+import cv2
 # Note: ipywidgets and IPython.display are for notebook UI, not needed in the class itself.
 
 class SleepMonitor:
@@ -14,7 +15,8 @@ class SleepMonitor:
                  channels=1,
                  rate=16000,
                  chunk_seconds=1,
-                 calibration_time=5):
+                 calibration_time=5,
+                 video_recording_enabled_by_default: bool = False): # New parameter
 
         self.output_dir = output_dir
         self.channels = channels
@@ -24,8 +26,15 @@ class SleepMonitor:
 
         self.background_noise_level = None
         self.recording = False
-        self.frames = []
+        self.frames = [] # Audio frames
         self.start_time = None
+
+        # Video related attributes
+        self.video_capture = None
+        self.video_writer = None
+        self.selected_camera_index = -1
+        self.video_recording_enabled = video_recording_enabled_by_default # Set from parameter
+        self.video_filename = None # Initialize video_filename
 
         # Create output directory if it doesn't exist
         if not os.path.exists(output_dir):
@@ -66,6 +75,40 @@ class SleepMonitor:
             # print(f"Error querying devices: {e}") # UI related
             self.devices = [] # Ensure self.devices is initialized
             self.device = None # Ensure self.device is initialized
+
+        # Initialize camera
+        self.detect_camera() # Call unconditionally for now
+
+    def detect_camera(self):
+        # Try to find an available camera
+        # print("Detecting cameras...") # UI related, remove for library code
+        for i in range(5): # Check first 5 indices
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                # print(f"Camera found at index {i}") # UI related
+                self.selected_camera_index = i
+                cap.release() # Release it immediately
+                return i
+        # print("No camera detected.") # UI related
+        self.selected_camera_index = -1
+        return -1
+
+    def _record_video_frames(self):
+        if not self.video_capture or not self.video_writer:
+            # print("Video capture or writer not initialized.") # Debug
+            return
+
+        # print("Starting video frame recording loop...") # Debug
+        while self.recording and self.video_recording_enabled:
+            ret, frame = self.video_capture.read()
+            if ret:
+                self.video_writer.write(frame)
+            else:
+                # print("Failed to read frame from video capture.") # Debug
+                # Could add a small sleep here if ret is False to avoid tight loop on error
+                time.sleep(0.01)
+                # Or break if consistently failing, but for now, keep trying as long as recording is active
+        # print("Video frame recording loop ended.") # Debug
 
     def set_device(self, device_id):
         """Set the recording device to use"""
@@ -161,12 +204,65 @@ class SleepMonitor:
             self.save_thread.daemon = True
             self.save_thread.start()
 
+            # Video recording start
+            if self.video_recording_enabled and self.selected_camera_index != -1:
+                try:
+                    # Create session directory for video if it doesn't exist (audio part might have created it)
+                    current_date_str = self.start_time.strftime("%Y-%m-%d")
+                    session_dir = os.path.join(self.output_dir, current_date_str)
+                    if not os.path.exists(session_dir):
+                        os.makedirs(session_dir)
+
+                    timestamp_str = self.start_time.strftime("%H-%M-%S")
+                    self.video_filename = os.path.join(session_dir, f"sleep_video_{timestamp_str}.mp4")
+
+                    self.video_capture = cv2.VideoCapture(self.selected_camera_index)
+                    if not self.video_capture.isOpened():
+                        raise Exception(f"Failed to open camera at index {self.selected_camera_index}")
+
+                    frame_width = int(self.video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    frame_height = int(self.video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    fps = self.video_capture.get(cv2.CAP_PROP_FPS)
+                    if fps == 0 or fps is None: # Handle cases where FPS is not reported or is zero
+                        # print("Warning: Camera FPS reported as 0, defaulting to 20 FPS.") # UI/Log
+                        fps = 20.0
+
+                    # print(f"Video properties: {frame_width}x{frame_height} @ {fps} FPS") # Debug
+
+                    self.video_writer = cv2.VideoWriter(
+                        self.video_filename,
+                        cv2.VideoWriter_fourcc(*'mp4v'),
+                        fps,
+                        (frame_width, frame_height)
+                    )
+                    if not self.video_writer.isOpened(): # isOpened for VideoWriter
+                         raise Exception(f"Failed to open VideoWriter for {self.video_filename}")
+
+
+                    self.video_thread = threading.Thread(target=self._record_video_frames)
+                    self.video_thread.daemon = True
+                    self.video_thread.start()
+                    # print(f"Video recording started for camera index {self.selected_camera_index} to {self.video_filename}") # UI
+                except Exception as ve:
+                    # print(f"Error starting video recording: {ve}") # UI
+                    self.video_recording_enabled = False # Disable if setup failed
+                    if self.video_capture:
+                        self.video_capture.release()
+                        self.video_capture = None
+                    if self.video_writer:
+                        self.video_writer.release()
+                        self.video_writer = None
+                    self.video_filename = None
+
             # print("Sleep monitoring started.") # UI
             return True
 
         except Exception as e:
             self.recording = False
             # print(f"Error starting recording: {e}") # UI
+            # Ensure video resources are cleaned up if audio part failed after video started
+            if self.video_capture: self.video_capture.release()
+            if self.video_writer: self.video_writer.release()
             return False
 
     def stop_recording(self):
@@ -174,23 +270,41 @@ class SleepMonitor:
             # print("Not currently recording!") # UI
             return
 
-        self.recording = False # Signal save_thread to stop
+        self.recording = False # Signal all recording threads to stop
 
         try:
+            # Stop audio stream and save thread
             if hasattr(self, 'stream') and self.stream:
                 self.stream.stop()
                 self.stream.close()
-
             if hasattr(self, 'save_thread') and self.save_thread.is_alive():
-                self.save_thread.join(timeout=5) # Wait for save thread
+                self.save_thread.join(timeout=5)
+            self._final_save() # Save any remaining audio frames
 
-            self._final_save() # Save any remaining frames
+            # Stop video thread and release resources
+            if hasattr(self, 'video_thread') and self.video_thread.is_alive():
+                self.video_thread.join(timeout=5)
+
+            if self.video_capture:
+                self.video_capture.release()
+                self.video_capture = None
+            if self.video_writer:
+                self.video_writer.release()
+                self.video_writer = None
+
+            if self.video_filename: # Only print if we actually started video
+                # print(f"Video recording stopped. Saved to {self.video_filename}") # UI
+                self.video_filename = None
 
             # print("Sleep monitoring stopped.") # UI
 
         except Exception as e:
             # print(f"Error stopping recording: {e}") # UI
-            pass # Ensure cleanup continues if possible
+            # Ensure resources are attempted to be released even on error
+            if hasattr(self, 'stream') and self.stream and self.stream.active: self.stream.stop(); self.stream.close()
+            if self.video_capture: self.video_capture.release(); self.video_capture = None
+            if self.video_writer: self.video_writer.release(); self.video_writer = None
+            pass
 
     def _save_recordings_periodically(self):
         """Thread function to periodically save audio to files"""

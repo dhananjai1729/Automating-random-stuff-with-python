@@ -20,7 +20,61 @@ mock_sd.wait.return_value = None
 # Force sounddevice to be seen as the mock *before* sleepmonitor module is loaded
 sys.modules['sounddevice'] = mock_sd
 
-# Now import SleepMonitor. It will import the mocked sounddevice.
+# --- Mock cv2 (OpenCV) ---
+mock_cv2 = MagicMock()
+
+# Mock cv2.VideoCapture class
+mock_video_capture_instance = MagicMock()
+mock_video_capture_instance.isOpened.return_value = True # Default for found camera
+mock_video_capture_instance.read.return_value = (True, np.zeros((480, 640, 3), dtype=np.uint8)) # Dummy frame
+mock_video_capture_instance.release = MagicMock()
+def mock_video_capture_get(prop_id):
+    if prop_id == mock_cv2.CAP_PROP_FRAME_WIDTH:
+        return 640
+    elif prop_id == mock_cv2.CAP_PROP_FRAME_HEIGHT:
+        return 480
+    elif prop_id == mock_cv2.CAP_PROP_FPS:
+        return 30.0
+    return 0
+mock_video_capture_instance.get.side_effect = mock_video_capture_get
+
+MockVideoCaptureClassFactory = MagicMock() # This will be the class VideoCapture
+def mock_video_capture_constructor(index):
+    # Reset relevant mocks for the instance each time a VideoCapture is "created"
+    mock_video_capture_instance.isOpened.reset_mock()
+    mock_video_capture_instance.read.reset_mock()
+    mock_video_capture_instance.release.reset_mock()
+    mock_video_capture_instance.get.reset_mock()
+
+    if index == 0: # Simulate camera found at index 0
+        mock_video_capture_instance.isOpened.return_value = True
+    else:
+        mock_video_capture_instance.isOpened.return_value = False
+    return mock_video_capture_instance
+
+MockVideoCaptureClassFactory.side_effect = mock_video_capture_constructor
+mock_cv2.VideoCapture = MockVideoCaptureClassFactory
+
+# Mock cv2.VideoWriter class
+mock_video_writer_instance = MagicMock()
+mock_video_writer_instance.write = MagicMock()
+mock_video_writer_instance.release = MagicMock()
+mock_video_writer_instance.isOpened.return_value = True # Simulate successful open
+
+MockVideoWriterClassFactory = MagicMock(return_value=mock_video_writer_instance) # Class that returns the instance
+mock_cv2.VideoWriter = MockVideoWriterClassFactory
+
+mock_cv2.VideoWriter_fourcc = MagicMock(return_value=12345)
+mock_cv2.CAP_PROP_FRAME_WIDTH = 3 # Using cv2 defined constants directly in get() mock
+mock_cv2.CAP_PROP_FRAME_HEIGHT = 4
+mock_cv2.CAP_PROP_FPS = 5
+
+
+sys.modules['cv2'] = mock_cv2
+# --- End Mock cv2 ---
+
+
+# Now import SleepMonitor. It will import the mocked sounddevice and cv2.
 from sleepmonitor import SleepMonitor
 
 # The global mock_sd object is already configured.
@@ -33,12 +87,27 @@ from sleepmonitor import SleepMonitor
 class TestSleepMonitor(unittest.TestCase):
 
     def setUp(self):
+        # Reset mocks that might hold state from other tests or previous runs if defined globally
+        mock_video_capture_instance.reset_mock(return_value=True, side_effect=True)
+        mock_video_writer_instance.reset_mock(return_value=True, side_effect=True)
+        MockVideoCaptureClassFactory.reset_mock(return_value=True, side_effect=True)
+        MockVideoWriterClassFactory.reset_mock(return_value=True, side_effect=True)
+
+        # Re-configure side effects for constructors after reset
+        MockVideoCaptureClassFactory.side_effect = mock_video_capture_constructor
+        MockVideoWriterClassFactory.return_value = mock_video_writer_instance
+
+
         # Create a temporary directory for test recordings
         self.test_output_dir = "sleep_recordings_test_actual"
         if not os.path.exists(self.test_output_dir):
             os.makedirs(self.test_output_dir)
-        # Now using the actual SleepMonitor class, it will use the mocked 'sd'
-        self.monitor = SleepMonitor(output_dir=self.test_output_dir)
+        # Now using the actual SleepMonitor class, it will use the mocked 'sd' and 'cv2'
+        # Explicitly disable video for most tests by default. Specific tests can enable it.
+        self.monitor = SleepMonitor(output_dir=self.test_output_dir, video_recording_enabled_by_default=False)
+        # Check that camera detection was (mock) attempted.
+        # If video_recording_enabled_by_default is False, selected_camera_index might still be set by detect_camera.
+        self.assertEqual(self.monitor.selected_camera_index, 0)
 
     def tearDown(self):
         # Remove the temporary directory after tests
@@ -169,21 +238,96 @@ class TestSleepMonitor(unittest.TestCase):
         self.assertEqual(monitor.calibration_time, 5)
         self.assertIsNone(monitor.background_noise_level)
         self.assertFalse(monitor.recording)
+        self.assertFalse(monitor.video_recording_enabled) # Check new default
 
     def test_initialization_custom(self):
         custom_dir = "custom_sleep_output_actual"
         if not os.path.exists(custom_dir):
             os.makedirs(custom_dir)
 
-        monitor = SleepMonitor(output_dir=custom_dir, channels=2, rate=44100, chunk_seconds=2, calibration_time=10)
+        monitor = SleepMonitor(
+            output_dir=custom_dir,
+            channels=2,
+            rate=44100,
+            chunk_seconds=2,
+            calibration_time=10,
+            video_recording_enabled_by_default=True # Test with video enabled
+        )
         self.assertEqual(monitor.output_dir, custom_dir)
         self.assertEqual(monitor.channels, 2)
         self.assertEqual(monitor.rate, 44100)
         self.assertEqual(monitor.chunk_seconds, 2)
         self.assertEqual(monitor.calibration_time, 10)
+        self.assertTrue(monitor.video_recording_enabled) # Check if True when set
 
         if os.path.exists(custom_dir):
             shutil.rmtree(custom_dir)
+
+    @patch('sleepmonitor.threading.Thread') # Mock threading.Thread
+    def test_start_stop_video_recording(self, MockThread):
+        # Instantiate monitor with video enabled
+        monitor = SleepMonitor(output_dir=self.test_output_dir, video_recording_enabled_by_default=True)
+        self.assertTrue(monitor.video_recording_enabled)
+        self.assertEqual(monitor.selected_camera_index, 0) # Mock camera detection should find index 0
+
+        # Mock the target methods for threads to check if they are started
+        mock_audio_save_thread_instance = MagicMock()
+        mock_video_record_thread_instance = MagicMock()
+
+        thread_map = {
+            monitor._save_recordings_periodically: mock_audio_save_thread_instance,
+            monitor._record_video_frames: mock_video_record_thread_instance
+        }
+
+        def mock_thread_constructor(target, daemon=False):
+            if target in thread_map:
+                # Return the specific mock instance for the known target
+                thread_mock = thread_map[target]
+                thread_mock.daemon = daemon # Set daemon attribute as the code does
+                return thread_mock
+            # Fallback for any other threads (should not happen in this test)
+            fallback_mock = MagicMock()
+            fallback_mock.daemon = daemon
+            return fallback_mock
+
+        MockThread.side_effect = mock_thread_constructor
+
+        # Start recording
+        monitor.start_recording()
+
+        self.assertTrue(monitor.recording)
+        self.assertIsNotNone(monitor.video_capture)
+        self.assertIsNotNone(monitor.video_writer)
+
+        # Check that VideoCapture methods were called
+        mock_video_capture_instance.isOpened.assert_called()
+        mock_video_capture_instance.get.assert_any_call(mock_cv2.CAP_PROP_FRAME_WIDTH)
+        mock_video_capture_instance.get.assert_any_call(mock_cv2.CAP_PROP_FRAME_HEIGHT)
+        mock_video_capture_instance.get.assert_any_call(mock_cv2.CAP_PROP_FPS)
+
+        # Check that VideoWriter was instantiated and isOpened called on its instance
+        MockVideoWriterClassFactory.assert_called_once() # Check constructor was called
+        mock_video_writer_instance.isOpened.assert_called() # Check instance method
+
+        # Check that the video recording thread was started
+        mock_video_record_thread_instance.start.assert_called_once()
+
+        # Simulate some time passing and frames being read (optional, more for integration)
+        # For this test, primarily checking setup and teardown calls.
+
+        # Stop recording
+        monitor.stop_recording()
+
+        self.assertFalse(monitor.recording)
+        mock_video_capture_instance.release.assert_called_once()
+        mock_video_writer_instance.release.assert_called_once()
+        self.assertIsNone(monitor.video_capture)
+        self.assertIsNone(monitor.video_writer)
+        self.assertIsNone(monitor.video_filename)
+
+        # Check that video thread was joined
+        mock_video_record_thread_instance.join.assert_called_with(timeout=5)
+
 
 if __name__ == '__main__':
     unittest.main()
